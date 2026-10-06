@@ -10,14 +10,18 @@ Full product and logic specification: [`docs/SPEC.md`](docs/SPEC.md)
 ## What it does
 
 1. The merchant picks a calculator: Wishlist Plus, Back in Stock, or a side-by-side comparison.
-2. The merchant enters three inputs: monthly sessions, average order value (USD), and store category.
+2. The merchant enters three inputs: monthly sessions, average order value (USD), and store category,
+   and optionally a store URL.
 3. The calculator shows:
    - a monthly revenue range, from **Quick wins** to **Full implementation**
    - a breakdown by revenue line (for example wishlist reminders, save for later, conversion uplift)
    - the matched Swym plan, its price, and the return per $1
 
-The logic follows the Swym Impact Estimator at its conservative setting: every revenue line is
-multiplied by 0.7. See [`docs/SPEC.md`](docs/SPEC.md) for each formula and each benchmark.
+Revenue uses the ROI model shared with Swym Intent Yield (`src/roiModel.js`), so both tools show
+the same numbers. See [`docs/SPEC.md`](docs/SPEC.md) for each formula and each benchmark.
+
+To check the match against the live Intent Yield API:
+`SCAN_ID=<a finished Intent Yield scan id> node test/roiModel.check.mjs`
 
 ## Inputs
 
@@ -25,7 +29,7 @@ multiplied by 0.7. See [`docs/SPEC.md`](docs/SPEC.md) for each formula and each 
 | --- | --- | --- |
 | Monthly sessions | 50,000 | Shopify Analytics, Reports, Sessions |
 | Average order value | $75 | Shopify Analytics, average order value |
-| Store category | Other | One of 7 categories; each sets its own engagement and AOV lift |
+| Store category | Other | One of 7 categories; sets plan usage only |
 
 A merchant can also open "Refine your assumptions" and enter their own monthly counts. The
 calculator then uses those counts in place of the benchmark rates.
@@ -69,7 +73,8 @@ Where the logic lives in `src/SwymRevenueCalculator.jsx`:
 
 | Name | What it does |
 | --- | --- |
-| `CONFIDENCE` | The 0.7 conservative multiplier |
+| `src/roiModel.js` | The ROI model, copied from Intent Yield's `src/roi.ts` |
+| `src/intentYield.js` | Calls Intent Yield's API for a store URL |
 | `CATEGORIES` | The 7 store categories and their profiles |
 | `MODES` | Per-product copy, plan prices and monthly caps |
 | `computeScenario()` | Runs the revenue lines once, for Quick wins or Full implementation |

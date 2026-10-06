@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { scanStore, getRoi, applyIntentYield } from "./intentYield.js";
+import { computeRoi, scenariosFromRoi, ROI_BENCHMARKS } from "./roiModel.js";
 import {
   Heart,
   Bell,
@@ -23,7 +25,7 @@ import {
  * Swym Revenue Opportunity Calculator (v3, Prototype 1)
  * Full page in getswym.com visual language: header, hero, animated heart, calculator,
  * plan match + ROI, demo/install CTAs, real case studies, footer.
- * Logic: sessions, AOV, store category -> Impact Estimator drivers -> plan match -> ROI. Client side only.
+ * Logic: sessions, AOV -> Intent Yield's ROI model (roiModel.js); category -> plan usage -> plan match -> ROI. Client side only.
  * Tracking: pushes swym_calc_* events to window.dataLayer (GTM).
  */
 
@@ -93,13 +95,8 @@ const UTM = "?utm_source=calculator&utm_medium=website&utm_campaign=roi_calculat
 // in a code review, confirmed, fixed by removing the selector rather than faking a conversion
 // rate this tool has no way to keep current.
 
-// Revenue logic ported from the Swym Impact Estimator (Jacob's estimator, 2026-09), per the eng
-// team's direction to use one ROI logic across tools. Only the drivers computable from this
-// page's three inputs (sessions, AOV, store category) are used. Inputs the estimator asks for and
-// this page does not (conversion rate, cart abandonment rate) use the estimator's own fallbacks.
-// Price drop alerts are left out: they need an email list size and a discounting strategy.
-// All estimates use the estimator's "conservative" confidence mode.
-const CONFIDENCE = 0.7;
+// Revenue comes from roiModel.js, the ROI model shared with Swym Intent Yield. The category
+// profiles and BENCH values below now only drive plan usage and the page's explanatory copy.
 
 // Per-category profile, copied from the estimator. wlEng: % of sessions that engage with the
 // wishlist. bisRel / sflRel: relevance factors. aovLift: Swym AOV lift % on wishlist-driven
@@ -299,53 +296,37 @@ function computeScenario(modeKey, s, rateKey) {
     const usage = modeKey === "bis" ? stage1 : stage1 * BENCH.wlitems;
     return { volume, aov, stage1, stage2, monthly, annual: monthly * 12, usage, steps: [], drivers: [] };
   }
-  const cv = BENCH.iacvr;
+  // Revenue comes from the model shared with Swym Intent Yield (roiModel.js). Category only
+  // sets plan usage below; Intent Yield's revenue model does not use it.
+  const roi = computeRoi({ traffic: volume, storeAov: aov });
+  const sc = scenariosFromRoi(roi, modeKey)[rateKey === "strong" ? "full" : "quick"];
+  const monthly = sc.monthly;
+  const swymAov = roi ? roi.resolved.swymAov : 0;
+  const orders = swymAov > 0 ? monthly / swymAov : 0;
+  const B = ROI_BENCHMARKS;
   if (modeKey === "bis") {
-    // BIS uses store AOV, not the Swym wishlist AOV: single-item triggered purchases.
     const subscribers = volume * (BENCH.bssr / 100) * cat.bisRel;
-    const alerted = subscribers * (BENCH.fsr / 100) * (BENCH.bisfire / 100);
-    const orders = alerted * (BENCH.biscvr / 100) * CONFIDENCE;
-    const monthly = orders * aov;
+    const bisSubs = roi ? roi.resolved.bisSubs : 0;
     return {
       volume, aov, stage1: subscribers, stage2: orders, monthly, annual: monthly * 12, usage: subscribers,
       steps: [
-        { label: "Alert subscribers", sub: `${BENCH.bssr}% of sessions x ${cat.bisRel} ${cat.label} relevance`, value: subscribers },
-        { label: "Alerts sent", sub: `${BENCH.fsr}% send rate x ${BENCH.bisfire}% restock rate`, value: alerted },
-        { label: "Recovered orders", sub: `${BENCH.biscvr}% alert CVR, conservative`, value: orders },
+        { label: "Alert subscribers", sub: `${B.bis_sub_rate}% of sessions`, value: bisSubs },
+        { label: "Alerts sent", sub: `${B.flow_send_rate}% send rate, half of them back-in-stock alerts`, value: bisSubs * (B.flow_send_rate / 100) * 0.5 },
+        { label: "Recovered orders", sub: `${B.bis_alert_cvr}% alert conversion rate`, value: orders },
       ],
-      drivers: [{ label: "Back-in-stock alerts", value: monthly }],
+      drivers: sc.drivers,
     };
   }
-  // Swym AOV applies to wishlist-driven orders only.
-  const wa = aov * (1 + (BENCH.aovbm * (cat.aovLift / 28)) / 100);
   const engaged = volume * (cat.wlEng / 100);
-  const wlPurchaseProb = Math.min((cv / 100) * BENCH.wlcvrmult, 0.25);
-  const wlRev = engaged * wlPurchaseProb * wa * BENCH.wlitems * (BENCH.wlrr / 100) * CONFIDENCE;
-  const cartInitRate = Math.min(cv * BENCH.cartmult, 35) / 100;
-  const abandonedCarts = volume * cartInitRate * (BENCH.cartAbandon / 100);
-  const sflCapture = abandonedCarts * ((cat.sflRel * BENCH.sflr) / 100);
-  const sflRev = sflCapture * (BENCH.fsr / 100) * (BENCH.sflcvr / 100) * wa * CONFIDENCE;
-  // CVR uplift runs on engaged sessions minus those already counted as wishlist purchases, so
-  // conversions in the reminder line are not counted twice.
-  const cvrGap = Math.max(0, BENCH.cvrbm - cv);
-  const cvrPool = Math.max(0, engaged - engaged * wlPurchaseProb);
-  const gapShare = rateKey === "strong" ? BENCH.cvrf : BENCH.cvrq;
-  const cvrRev = cvrPool * ((cvrGap * cat.cvrLift * (gapShare / 100)) / 100) * wa * CONFIDENCE;
-  const monthly = wlRev + sflRev + cvrRev;
-  // Every wishlist driver is priced at the Swym AOV, so revenue / wa is the order count.
-  const orders = wa > 0 ? monthly / wa : 0;
+  const swymSessions = roi ? volume * (B.swym_engage_rate / 100) : 0;
   return {
     volume, aov, stage1: engaged, stage2: orders, monthly, annual: monthly * 12, usage: engaged * BENCH.wlitems,
     steps: [
-      { label: "Wishlist-engaged shoppers", sub: `${cat.wlEng}% of sessions, ${cat.label}`, value: engaged },
-      { label: "Abandoned carts captured by save for later", sub: `${Math.round(cat.sflRel * BENCH.sflr * 10) / 10}% of ~${fmtCount(abandonedCarts)} abandoned carts`, value: sflCapture },
-      { label: "Swym-influenced orders", sub: `at a ${fmtMoney(wa, "$")} Swym AOV (+${Math.round((wa / aov - 1) * 100) || 0}%)`, value: orders },
+      { label: "Swym-engaged shoppers", sub: `${B.swym_engage_rate}% of sessions`, value: swymSessions },
+      { label: "Shoppers who save to a wishlist", sub: `${B.wishlist_save_rate}% of engaged shoppers`, value: swymSessions * (B.wishlist_save_rate / 100) },
+      { label: "Swym-influenced orders", sub: `at a ${fmtMoney(swymAov, "$")} Swym AOV (+${roi ? roi.aovLiftPct : 0}%)`, value: orders },
     ],
-    drivers: [
-      { label: "Wishlist reminders", value: wlRev },
-      { label: "Save for later", value: sflRev },
-      { label: rateKey === "strong" ? "Conversion uplift, full implementation" : "Conversion uplift, quick wins", value: cvrRev },
-    ],
+    drivers: sc.drivers,
   };
 }
 
@@ -1027,7 +1008,7 @@ function ChooseCalculator({ onPick }) {
 function HowItWorks({ onPick }) {
   const steps = [
     { n: "01", t: "Enter three things", d: "Monthly sessions, average order value, and your store category. Sessions are in Shopify Analytics under Reports.", I: MousePointerClick },
-    { n: "02", t: "We size the opportunity", d: "We show a quick wins and a full implementation range, from conservative ecommerce benchmarks tuned to your category.", I: BarChart3 },
+    { n: "02", t: "We size the opportunity", d: "We show a quick wins and a full implementation range, using the same ROI model as Swym Intent Yield.", I: BarChart3 },
     { n: "03", t: "See the ROI of acting on it", d: "We match your estimated usage to a real Swym plan and show estimated revenue per dollar spent, so the next step is obvious: book a demo or install.", I: Sparkles },
   ];
   return (
@@ -1237,7 +1218,48 @@ function LeadGate({ cfg, lead, setLead, monthlyPreview, symbol }) {
 
 function Calculator({ modeKey, s, update, reset, symbol, copied, copyText, lead, setLead }) {
   const cfg = MODES[modeKey];
-  const r = useMemo(() => compute(modeKey, s), [modeKey, s]);
+  const local = useMemo(() => compute(modeKey, s), [modeKey, s]);
+  // Intent Yield estimate: a store URL is scanned once, then ROI is re-fetched whenever
+  // sessions or AOV change. While an estimate is loaded, every figure on the page uses it.
+  const [storeUrl, setStoreUrl] = useState("");
+  const [iy, setIy] = useState({ status: "idle", jobId: null, roi: null, error: "" });
+  const iyAbort = useRef(null);
+  async function runIntentYield() {
+    const url = storeUrl.trim();
+    if (!url) return;
+    iyAbort.current?.abort();
+    const ctrl = new AbortController();
+    iyAbort.current = ctrl;
+    setIy({ status: "scanning", jobId: null, roi: null, error: "" });
+    try {
+      const { jobId } = await scanStore(url, ctrl.signal);
+      const roi = await getRoi(jobId, Number(s.volume) || 0, Number(s.aov) || 0, ctrl.signal);
+      setIy({ status: "ready", jobId, roi, error: "" });
+      track("iy_estimate", { mode: modeKey, monthly_full: Math.round(roi.uplift.fullMonthly) });
+    } catch (e) {
+      if (e.name === "AbortError") return;
+      setIy({ status: "error", jobId: null, roi: null, error: e.message });
+      track("iy_error", { mode: modeKey, error: e.message.slice(0, 80) });
+    }
+  }
+  useEffect(() => {
+    if (!iy.jobId) return;
+    const ctrl = new AbortController();
+    const id = setTimeout(async () => {
+      try {
+        const roi = await getRoi(iy.jobId, Number(s.volume) || 0, Number(s.aov) || 0, ctrl.signal);
+        setIy((prev) => ({ ...prev, roi, error: "" }));
+      } catch (e) {
+        if (e.name !== "AbortError") setIy((prev) => ({ ...prev, error: e.message }));
+      }
+    }, 500);
+    return () => { clearTimeout(id); ctrl.abort(); };
+  }, [s.volume, s.aov]); // eslint-disable-line react-hooks/exhaustive-deps
+  function clearIntentYield() {
+    iyAbort.current?.abort();
+    setIy({ status: "idle", jobId: null, roi: null, error: "" });
+  }
+  const r = useMemo(() => (iy.roi ? applyIntentYield(local, iy.roi, modeKey, cfg.plans[cfg.plans.length - 1].price) : local), [local, iy.roi, modeKey, cfg]);
   const [refineOpen, setRefineOpen] = useState(false);
   const [formulaOpen, setFormulaOpen] = useState(false);
   const typicalAnim = useCountUp(r.typical.monthly, 900);
@@ -1288,6 +1310,22 @@ function Calculator({ modeKey, s, update, reset, symbol, copied, copyText, lead,
               <CategorySelect id="category" value={s.category} onChange={(v) => update({ category: v })} />
             </div>
 
+            <div className="mt-6 border-t pt-5" style={{ borderColor: "var(--border)" }}>
+              <label htmlFor="store-url" className="swym-label">Store URL (optional)</label>
+              <div className="mt-2 flex gap-2">
+                <input id="store-url" type="url" inputMode="url" placeholder="https://yourstore.com" className="swym-input" value={storeUrl} onChange={(e) => setStoreUrl(e.target.value)} />
+                <button className="swym-btn swym-btn-ghost shrink-0" onClick={runIntentYield} disabled={!storeUrl.trim() || iy.status === "scanning"}>
+                  {iy.status === "scanning" ? "Scanning..." : "Get estimate"}
+                </button>
+              </div>
+              <p className="swym-help" aria-live="polite">
+                {iy.status === "scanning" && "Intent Yield is scanning your store. This takes about a minute."}
+                {iy.status === "ready" && (<>Showing Intent Yield's estimate for this store. <button className="font-semibold underline" onClick={clearIntentYield}>Use the calculator's estimate</button></>)}
+                {iy.status === "error" && iy.error}
+                {iy.status === "idle" && "Add your store to get an estimate from Swym Intent Yield."}
+              </p>
+            </div>
+
             <button onClick={() => setRefineOpen(!refineOpen)} className="mt-6 flex w-full items-center justify-between border-t pt-5 text-sm font-semibold" style={{ borderColor: "var(--border)", color: "var(--navy-soft)" }} aria-expanded={refineOpen}>
               <span className="flex items-center gap-2">
                 <SlidersHorizontal size={16} /> Refine your assumptions
@@ -1313,7 +1351,7 @@ function Calculator({ modeKey, s, update, reset, symbol, copied, copyText, lead,
                   </div>
                 ) : (
                   <p className="swym-help">
-                    Estimates use conservative ecommerce benchmarks, tuned by store category. We assume an industry average {BENCH.iacvr}% conversion rate and {BENCH.cartAbandon}% cart abandonment.
+                    Estimates use the same benchmarks as Swym Intent Yield. We assume an industry average {ROI_BENCHMARKS.industry_avg_cvr}% conversion rate and a {ROI_BENCHMARKS.aov_lift_benchmark}% higher order value on Swym-influenced orders.
                   </p>
                 )}
               </div>
@@ -1336,9 +1374,11 @@ function Calculator({ modeKey, s, update, reset, symbol, copied, copyText, lead,
                       {sameRange ? fmtMoney(strongAnim, symbol) : <>{fmtMoney(typicalAnim, symbol)} <span className="text-2xl font-medium sm:text-4xl" style={{ color: "var(--muted)" }}>to</span> {fmtMoney(strongAnim, symbol)}</>}
                     </p>
                     <p className="mt-3 max-w-lg text-sm" style={{ color: "var(--navy-soft)" }}>
-                      {s.useOwnData
+                      {r.source === "intent-yield"
+                        ? `Estimate from Swym Intent Yield for ${storeUrl.trim()}. Up to ${fmtMoney(r.strong.annual, symbol)} a year in new revenue.`
+                        : s.useOwnData
                         ? "Based on the counts you entered."
-                        : `Conservative estimate for a ${getCategory(s.category).label.toLowerCase()} store. Up to ${fmtMoney(annualAnim, symbol)} a year${sameRange ? "" : " with every feature live"}.`}
+                        : `Estimate using Swym Intent Yield's model. Up to ${fmtMoney(annualAnim, symbol)} a year${sameRange ? "" : " with every feature live"}.`}
                     </p>
 
                     <Breakdown modeKey={modeKey} cfg={cfg} s={s} r={r} symbol={symbol} />
@@ -1635,7 +1675,7 @@ function PlanFit({ r, cfg, symbol }) {
 function Formula({ modeKey, cfg, s, r, symbol }) {
   // Deliberately light on specifics: shows what was estimated, not every benchmark behind it.
   const lines = [];
-  lines.push(`Store category: ${getCategory(s.category).label}. Conservative benchmarks, ${BENCH.iacvr}% industry average conversion rate assumed`);
+  lines.push(`Swym Intent Yield's ROI model, ${ROI_BENCHMARKS.industry_avg_cvr}% industry average conversion rate assumed. Store category (${getCategory(s.category).label}) sets plan usage only`);
   lines.push(`Estimated revenue: ${fmtMoneyRange(r.typical.monthly, r.strong.monthly, symbol)} monthly`);
   lines.push(`Estimated usage: ${fmtCount(r.strong.usage)} ${cfg.usageNoun}/mo, used only to match a plan`);
   if (!r.enterprise && r.plan.price > 0) lines.push(`Revenue per $1 of plan: ${fmtX(r.roiTypical)} to ${fmtX(r.roiStrong)} against a $${r.plan.price.toFixed(2)} plan`);
@@ -1894,7 +1934,7 @@ function CategorySelect({ id, value, onChange }) {
           </button>
         ))}
       </div>
-      <p className="swym-help">Sets the engagement and order value benchmarks for your vertical.</p>
+      <p className="swym-help">Used to estimate your plan usage.</p>
     </fieldset>
   );
 }
